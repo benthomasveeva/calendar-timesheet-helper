@@ -1,8 +1,8 @@
 {
     "version": "1.0.0",
     "summary": "helpful summary of your project, less than 80 characters",
-    "repository": "https://github.com/benthomasveeva/calendar_timesheet_helper_2.git",
-    "homepage": "https://benthomasveeva.github.io/calendar_timesheet_helper_2",
+    "repository": "https://github.com/benthomasveeva/calendar-timesheet-helper.git",
+    "homepage": "https://benthomasveeva.github.io/calendar-timesheet-helper",
     "license": "BSD3",
     "source-directories": [
         "src"
