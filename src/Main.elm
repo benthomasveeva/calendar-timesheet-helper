@@ -13,6 +13,7 @@ import Element.Font as Font
 import Element.Input as Input
 import Html exposing (Html)
 import Json.Decode as JD
+import Json.Decode.Pipeline as JDPipe
 import Json.Encode as JE
 import RemoteData exposing (RemoteData(..))
 import Return
@@ -35,6 +36,15 @@ type alias GapiData a =
 type GapiError
     = GapiAuthError
     | GapiUnknownError String
+
+
+type alias YoloData a =
+    RemoteData YoloError a
+
+
+type YoloError
+    = NoCredentialsAvailable
+    | UnknownYoloError JE.Value
 
 
 type alias Credential =
@@ -60,7 +70,7 @@ type alias EventColor =
 
 
 type alias Model =
-    { credential : MyData Credential
+    { credential : YoloData Credential
     , calendar : MyData String
     , today : MyData Date
     , colors : Dict String EventColor
@@ -118,11 +128,8 @@ update msg model =
                 Ok GoogleYoloReady ->
                     ( { model | credential = Loading }, sendMsg Login )
 
-                Ok (CredentialSuccess credential) ->
-                    ( { model | credential = Success credential }, LoadApi credential.email |> sendMsg )
-
-                Ok CredentialFail ->
-                    ( { model | credential = Failure "Login failed. See console for more info." }, Cmd.none )
+                Ok (CredentialResponse response) ->
+                    ( { model | credential = response }, respondToCredential response )
 
                 Ok GapiReady ->
                     ( { model | calendar = Loading }, Cmd.batch [ sendMsg LoadCalendars, sendMsg LoadColors ] )
@@ -191,6 +198,25 @@ update msg model =
         GoToCurrentWeek ->
             Return.singleton { model | weeksBack = 0 }
                 |> Return.effect_ loadEvents
+
+
+respondToCredential : YoloData Credential -> Cmd msg
+respondToCredential loadableCred =
+    case loadableCred of
+        Success cred ->
+            LoadApi cred.email |> sendMsg
+
+        Failure NoCredentialsAvailable ->
+            LoginHint |> sendMsg
+
+        Failure (UnknownYoloError _) ->
+            Cmd.none
+
+        NotAsked ->
+            Cmd.none
+
+        Loading ->
+            Cmd.none
 
 
 respondToGapiFailure : GapiData a -> Cmd msg
@@ -507,6 +533,7 @@ viewMarkIncompleteButton data =
 
 type OutMsg
     = Login
+    | LoginHint
     | LoadApi String
     | LoadCalendars
     | LoadColors
@@ -528,6 +555,9 @@ encodeOutMsg msg =
     case msg of
         Login ->
             JE.object [ ( "msg", JE.string "login" ) ]
+
+        LoginHint ->
+            JE.object [ ( "msg", JE.string "loginHint" ) ]
 
         LoadApi email ->
             JE.object
@@ -637,8 +667,7 @@ changeEventColor calId colorId eventId =
 
 type JsMsg
     = GoogleYoloReady
-    | CredentialSuccess Credential
-    | CredentialFail
+    | CredentialResponse (YoloData Credential)
     | GapiReady
     | CalendarList (MyData (List ( String, Bool )))
     | Colors (MyData (Dict ColorId EventColor))
@@ -664,8 +693,7 @@ jsMsgDecoder =
     pickDecoder "msg"
         JD.string
         [ ( "googleyoloready", JD.succeed GoogleYoloReady )
-        , ( "credentialsuccess", credentialSuccessDecoder )
-        , ( "credentialfail", JD.succeed CredentialFail )
+        , ( "credentials", credentialDecoder )
         , ( "gapiready", JD.succeed GapiReady )
         , ( "calendarlist", calendarListDecoder )
         , ( "colors", colorsDecoder )
@@ -675,12 +703,35 @@ jsMsgDecoder =
         ]
 
 
+credentialDecoder : JD.Decoder JsMsg
+credentialDecoder =
+    JD.oneOf
+        [ credentialSuccessDecoder, credentialFailDecoder ]
+
+
 credentialSuccessDecoder : JD.Decoder JsMsg
 credentialSuccessDecoder =
     JD.map2 Credential
         (JD.field "email" JD.string)
         (JD.field "idToken" JD.string)
-        |> JD.map CredentialSuccess
+        |> JD.map (Success >> CredentialResponse)
+
+
+credentialFailDecoder : JD.Decoder JsMsg
+credentialFailDecoder =
+    let
+        handleErrorType errorType =
+            case errorType of
+                "noCredentialsAvailable" ->
+                    JD.succeed NoCredentialsAvailable
+
+                _ ->
+                    JD.value |> JD.map UnknownYoloError
+    in
+    JDPipe.decode handleErrorType
+        |> JDPipe.requiredAt [ "error", "type" ] JD.string
+        |> JDPipe.resolve
+        |> JD.map (Failure >> CredentialResponse)
 
 
 calendarListDecoder : JD.Decoder JsMsg
