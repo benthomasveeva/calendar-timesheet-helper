@@ -33,7 +33,7 @@ app.ports.elmToJs.subscribe((elmMsg) => {
             app.ports.jsToElm.send({ "msg": "credentialsuccess", "idToken": credential.idToken, "email": credential.id });
         }, (error) => {
             console.log("error", error);
-            app.ports.jsToElm.send({ "msg": "credentialfail", "error": error });
+            // app.ports.jsToElm.send({ "msg": "credentialfail", "error": error });
         });
     } else if (elmMsg.msg === "loadapi") {
         gapi.load('client', () => {
