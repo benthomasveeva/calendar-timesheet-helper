@@ -693,7 +693,8 @@ jsMsgDecoder =
     pickDecoder "msg"
         JD.string
         [ ( "googleyoloready", JD.succeed GoogleYoloReady )
-        , ( "credentials", credentialDecoder )
+        , ( "credentialsuccess", credentialSuccessDecoder )
+        , ( "credentialfail", credentialFailDecoder )
         , ( "gapiready", JD.succeed GapiReady )
         , ( "calendarlist", calendarListDecoder )
         , ( "colors", colorsDecoder )
@@ -701,12 +702,6 @@ jsMsgDecoder =
         , ( "eventcreated", JD.succeed EventCreated )
         , ( "eventupdated", JD.map EventUpdated (JD.field "eventId" JD.string) )
         ]
-
-
-credentialDecoder : JD.Decoder JsMsg
-credentialDecoder =
-    JD.oneOf
-        [ credentialSuccessDecoder, credentialFailDecoder ]
 
 
 credentialSuccessDecoder : JD.Decoder JsMsg
