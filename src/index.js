@@ -77,6 +77,10 @@ app.ports.elmToJs.subscribe((elmMsg) => {
             summary: elmMsg.eventName,
             visibility: "private",
             transparency: "transparent",
+            reminders: {
+                useDefault: false,
+                overrides: []
+            },
             start: { dateTime: elmMsg.startTime },
             end: { dateTime: elmMsg.endTime }
         }).then((resp) => {
