@@ -1,4 +1,4 @@
-port module Main exposing (..)
+module Main exposing (..)
 
 import Color
 import Color.Convert
@@ -12,45 +12,20 @@ import Element.Border as Border
 import Element.Font as Font
 import Element.Input as Input
 import Html exposing (Html)
+import Http
 import Json.Decode as JD
-import Json.Decode.Pipeline as JDPipe
+import Json.Decode.Extra as JDExtra
 import Json.Encode as JE
-import RemoteData exposing (RemoteData(..))
+import Navigation
+import OAuth
+import OAuth.Implicit
+import RemoteData exposing (RemoteData(..), WebData)
 import Return
-import Set exposing (Set)
-import Task
+import Task exposing (Task)
 import Time
 
 
 ---- MODEL ----
-
-
-type alias MyData a =
-    RemoteData String a
-
-
-type alias GapiData a =
-    RemoteData GapiError a
-
-
-type GapiError
-    = GapiAuthError
-    | GapiUnknownError String
-
-
-type alias YoloData a =
-    RemoteData YoloError a
-
-
-type YoloError
-    = NoCredentialsAvailable
-    | UnknownYoloError JE.Value
-
-
-type alias Credential =
-    { email : String
-    , idToken : String
-    }
 
 
 type alias Event =
@@ -70,28 +45,31 @@ type alias EventColor =
 
 
 type alias Model =
-    { credential : YoloData Credential
-    , calendar : MyData String
-    , today : MyData Date
+    { calendar : WebData String
+    , today : Maybe Date
     , colors : Dict String EventColor
-    , events : GapiData (List Event)
-    , updatingEvents : Set String
+    , events : WebData (List Event)
     , weeksBack : Int
+    , oauthToken : Maybe OAuth.ResponseToken
+    , location : Navigation.Location
     }
 
 
-init : ( Model, Cmd Msg )
-init =
-    ( { credential = NotAsked
-      , calendar = NotAsked
-      , today = NotAsked
-      , colors = Dict.empty
-      , events = NotAsked
-      , updatingEvents = Set.empty
-      , weeksBack = 0
-      }
-    , Task.perform RxDate Date.now
-    )
+init : Navigation.Location -> ( Model, Cmd Msg )
+init location =
+    Return.singleton
+        { calendar = NotAsked
+        , today = Nothing
+        , colors = Dict.empty
+        , events = NotAsked
+        , weeksBack = 0
+        , oauthToken = OAuth.Implicit.parse location |> Result.toMaybe
+        , location = location
+        }
+        |> Return.command (Task.perform RxDate Date.now)
+        |> Return.effect_ (.oauthToken >> Maybe.map getCalendarList >> Maybe.withDefault Cmd.none)
+        |> Return.effect_ (.oauthToken >> Maybe.map getColors >> Maybe.withDefault Cmd.none)
+        |> Return.command (Navigation.modifyUrl location.origin)
 
 
 
@@ -109,7 +87,10 @@ incompleteColorId =
 
 
 type Msg
-    = RxJsMsg (Result String JsMsg)
+    = RxPrimaryCalendarId (WebData String)
+    | RxColors (WebData (Dict ColorId EventColor))
+    | RxEvents (WebData (List Event))
+    | RxEventAck (WebData String)
     | RxDate Date
     | RefreshEvents
     | NewEvent String
@@ -118,58 +99,29 @@ type Msg
     | GoBackOneWeek
     | GoForwardOneWeek
     | GoToCurrentWeek
+    | OAuthAuthorize
+    | NavigationNoOp
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        RxJsMsg jsMsg ->
-            case jsMsg of
-                Ok GoogleYoloReady ->
-                    ( { model | credential = Loading }, sendMsg Login )
+        RxPrimaryCalendarId data ->
+            Return.singleton { model | calendar = data }
+                |> Return.effect_ loadEvents
 
-                Ok (CredentialResponse response) ->
-                    ( { model | credential = response }, respondToCredential response )
+        RxColors data ->
+            Return.singleton { model | colors = RemoteData.withDefault model.colors data }
 
-                Ok GapiReady ->
-                    ( { model | calendar = Loading }, Cmd.batch [ sendMsg LoadCalendars, sendMsg LoadColors ] )
+        RxEvents data ->
+            Return.singleton { model | events = data }
 
-                Ok (CalendarList result) ->
-                    let
-                        calendar =
-                            RemoteData.andThen
-                                (List.filter Tuple.second
-                                    >> List.head
-                                    >> Maybe.map Tuple.first
-                                    >> Result.fromMaybe "No Primary Calendar"
-                                    >> RemoteData.fromResult
-                                )
-                                result
-                    in
-                    Return.singleton
-                        { model | calendar = calendar }
-                        |> Return.effect_ loadEvents
-
-                Ok (Colors colorsResult) ->
-                    Return.singleton { model | colors = colorsResult |> RemoteData.withDefault model.colors }
-
-                Ok (Events eventsResult) ->
-                    Return.singleton { model | events = eventsResult }
-                        |> Return.command (respondToGapiFailure eventsResult)
-
-                Ok EventCreated ->
-                    Return.singleton model
-                        |> Return.effect_ loadEvents
-
-                Ok (EventUpdated eventId) ->
-                    Return.singleton { model | updatingEvents = Set.remove eventId model.updatingEvents }
-                        |> Return.effect_ loadEventsIfNoneUpdating
-
-                Err err ->
-                    ( model, Debug.log "jsMsg Error" err |> always Cmd.none )
+        RxEventAck _ ->
+            Return.singleton model
+                |> Return.effect_ loadEvents
 
         RxDate today ->
-            ( { model | today = Success today }, Cmd.none )
+            ( { model | today = Just today }, Cmd.none )
 
         RefreshEvents ->
             Return.singleton model
@@ -181,11 +133,11 @@ update msg model =
 
         MarkComplete eventName ->
             Return.singleton model
-                |> Return.andThen (changeEventsColor eventName completeColorId)
+                |> Return.effect_ (changeEventsColor eventName completeColorId)
 
         MarkIncomplete eventName ->
             Return.singleton model
-                |> Return.andThen (changeEventsColor eventName incompleteColorId)
+                |> Return.effect_ (changeEventsColor eventName incompleteColorId)
 
         GoBackOneWeek ->
             Return.singleton { model | weeksBack = model.weeksBack + 1 }
@@ -199,51 +151,235 @@ update msg model =
             Return.singleton { model | weeksBack = 0 }
                 |> Return.effect_ loadEvents
 
+        OAuthAuthorize ->
+            Return.singleton model
+                |> Return.effect_ (.location >> login)
 
-respondToCredential : YoloData Credential -> Cmd msg
-respondToCredential loadableCred =
-    case loadableCred of
-        Success cred ->
-            LoadApi cred.email |> sendMsg
-
-        Failure NoCredentialsAvailable ->
-            LoginHint |> sendMsg
-
-        Failure (UnknownYoloError _) ->
-            Cmd.none
-
-        NotAsked ->
-            Cmd.none
-
-        Loading ->
-            Cmd.none
+        NavigationNoOp ->
+            Return.singleton model
 
 
-respondToGapiFailure : GapiData a -> Cmd msg
-respondToGapiFailure loadable =
-    case loadable of
-        Failure GapiAuthError ->
-            sendMsg Login
 
-        Failure (GapiUnknownError error) ->
-            Debug.log "Gapi Error" error |> always Cmd.none
+---- COMMANDS ----
 
-        Success _ ->
-            Cmd.none
 
-        Loading ->
-            Cmd.none
+login : Navigation.Location -> Cmd Msg
+login location =
+    OAuth.Implicit.authorize
+        { clientId = "159193416244-l4tsfgdhbn402qq57ajahsf3cu41vno0.apps.googleusercontent.com"
+        , redirectUri = location.origin ++ location.pathname
+        , responseType = OAuth.Token
+        , scope = [ "email", "profile", "https://www.googleapis.com/auth/calendar" ]
+        , state = Nothing
+        , url = "https://accounts.google.com/o/oauth2/v2/auth"
+        }
 
-        NotAsked ->
-            Cmd.none
+
+getCalendarList : OAuth.ResponseToken -> Cmd Msg
+getCalendarList response =
+    let
+        calendarListDecoder =
+            JD.field "items" <|
+                JD.list
+                    (JD.map2 (,)
+                        (JD.field "id" JD.string)
+                        (JD.map (Maybe.withDefault False) <| JD.maybe <| JD.field "primary" JD.bool)
+                    )
+
+        findPrimaryCalendar =
+            List.filter Tuple.second
+                >> List.head
+                >> Maybe.map Tuple.first
+                >> Result.fromMaybe "No Primary Calendar Found"
+                >> JDExtra.fromResult
+    in
+    Http.request
+        { method = "GET"
+        , body = Http.emptyBody
+        , headers = OAuth.use response.token []
+        , withCredentials = False
+        , url = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
+        , expect = Http.expectJson (calendarListDecoder |> JD.andThen findPrimaryCalendar)
+        , timeout = Nothing
+        }
+        |> RemoteData.sendRequest
+        |> Cmd.map RxPrimaryCalendarId
+
+
+getColors : OAuth.ResponseToken -> Cmd Msg
+getColors response =
+    let
+        decoder =
+            JD.field "event" <|
+                JD.dict <|
+                    JD.map2 EventColor
+                        (JD.field "background" JD.string)
+                        (JD.field "foreground" JD.string)
+    in
+    Http.request
+        { method = "GET"
+        , body = Http.emptyBody
+        , headers = OAuth.use response.token []
+        , withCredentials = False
+        , url = "https://www.googleapis.com/calendar/v3/colors"
+        , expect = Http.expectJson decoder
+        , timeout = Nothing
+        }
+        |> RemoteData.sendRequest
+        |> Cmd.map RxColors
+
+
+loadEvents : Model -> Cmd Msg
+loadEvents model =
+    Maybe.map3 (getEventsRequest model.weeksBack)
+        model.today
+        (RemoteData.toMaybe model.calendar)
+        model.oauthToken
+        |> Maybe.map (RemoteData.sendRequest >> Cmd.map RxEvents)
+        |> Maybe.withDefault Cmd.none
+
+
+getEventsRequest : Int -> Date -> String -> OAuth.ResponseToken -> Http.Request (List Event)
+getEventsRequest weeksBack today calendarId response =
+    let
+        decoder =
+            JD.field "items" (JD.map (List.filterMap identity) <| JD.list eventDecoder)
+
+        eventDecoder =
+            JD.maybe <|
+                JD.map5 makeEvent
+                    (JD.field "summary" JD.string)
+                    (JD.at [ "start", "dateTime" ] JDExtra.date)
+                    (JD.at [ "end", "dateTime" ] JDExtra.date)
+                    (JD.field "id" JD.string)
+                    (JD.field "colorId" JD.string)
+
+        makeEvent name start end id color =
+            Event name start end id color (Date.Extra.diff Date.Extra.Minute start end)
+    in
+    Http.request
+        { method = "GET"
+        , body = Http.emptyBody
+        , headers = OAuth.use response.token []
+        , withCredentials = False
+        , url =
+            "https://www.googleapis.com/calendar/v3/calendars/"
+                ++ calendarId
+                ++ "/events?singleEvents=true&timeMin="
+                ++ (Date.Extra.toIsoString <| Date.Extra.floor Date.Extra.Saturday <| Date.Extra.add Date.Extra.Week (-1 * weeksBack) today)
+                ++ "&timeMax="
+                ++ (Date.Extra.toIsoString <| Date.Extra.ceiling Date.Extra.Saturday <| Date.Extra.add Date.Extra.Week (-1 * weeksBack) today)
+        , expect = Http.expectJson decoder
+        , timeout = Nothing
+        }
+
+
+createEvent : String -> Model -> Cmd Msg
+createEvent eventName model =
+    Maybe.map3 (createEventRequest eventName)
+        model.today
+        (RemoteData.toMaybe model.calendar)
+        model.oauthToken
+        |> Maybe.map (RemoteData.sendRequest >> Cmd.map RxEventAck)
+        |> Maybe.withDefault Cmd.none
+
+
+createEventRequest : String -> Date -> String -> OAuth.ResponseToken -> Http.Request String
+createEventRequest eventName today calendarId oauth =
+    let
+        bodyValue =
+            JE.object
+                [ ( "colorId", JE.string "11" )
+                , ( "summary", JE.string eventName )
+                , ( "visibility", JE.string "private" )
+                , ( "transparency", JE.string "transparent" )
+                , ( "reminders"
+                  , JE.object
+                        [ ( "useDefault", JE.bool False )
+                        , ( "overrides", JE.list [] )
+                        ]
+                  )
+                , ( "start", JE.object [ ( "dateTime", JE.string <| Date.Extra.toIsoString <| Date.Extra.add Date.Extra.Hour -1 <| Date.Extra.floor Date.Extra.Hour today ) ] )
+                , ( "end", JE.object [ ( "dateTime", JE.string <| Date.Extra.toIsoString <| Date.Extra.floor Date.Extra.Hour today ) ] )
+                ]
+    in
+    Http.request
+        { method = "POST"
+        , body = Http.jsonBody bodyValue
+        , headers = OAuth.use oauth.token []
+        , withCredentials = False
+        , url =
+            "https://www.googleapis.com/calendar/v3/calendars/"
+                ++ calendarId
+                ++ "/events"
+        , expect = Http.expectString
+        , timeout = Nothing
+        }
+
+
+changeEventsColor : String -> ColorId -> Model -> Cmd Msg
+changeEventsColor eventName newColor model =
+    Maybe.map3 (changeEventsColorHelper eventName newColor)
+        (RemoteData.toMaybe model.events)
+        (RemoteData.toMaybe model.calendar)
+        model.oauthToken
+        |> Maybe.andThen
+            (\task ->
+                Maybe.map3
+                    (\today calendar oauth ->
+                        task
+                            |> Task.andThen
+                                (\_ ->
+                                    getEventsRequest model.weeksBack today calendar oauth
+                                        |> Http.toTask
+                                        |> RemoteData.fromTask
+                                )
+                    )
+                    model.today
+                    (RemoteData.toMaybe model.calendar)
+                    model.oauthToken
+            )
+        |> Maybe.map (Task.perform RxEvents)
+        |> Maybe.withDefault Cmd.none
+
+
+changeEventsColorHelper : String -> ColorId -> List Event -> String -> OAuth.ResponseToken -> Task Never (List (WebData String))
+changeEventsColorHelper eventName newColor events calendarId oauth =
+    events
+        |> List.filter (.name >> (==) eventName)
+        |> List.map (.id >> changeEventColorRequest calendarId newColor oauth >> Http.toTask >> RemoteData.fromTask)
+        |> Task.sequence
+
+
+changeEventColorRequest : String -> ColorId -> OAuth.ResponseToken -> String -> Http.Request String
+changeEventColorRequest calendarId colorId oauth eventId =
+    let
+        bodyValue =
+            JE.object
+                [ ( "colorId", JE.string colorId )
+                ]
+    in
+    Http.request
+        { method = "PATCH"
+        , body = Http.jsonBody bodyValue
+        , headers = OAuth.use oauth.token []
+        , withCredentials = False
+        , url =
+            "https://www.googleapis.com/calendar/v3/calendars/"
+                ++ calendarId
+                ++ "/events/"
+                ++ eventId
+        , expect = Http.expectString
+        , timeout = Nothing
+        }
 
 
 
 ---- VIEW ----
 
 
-viewMyData : (a -> Element msg) -> MyData a -> Element msg
-viewMyData viewFun data =
+viewWebData : (a -> Element msg) -> WebData a -> Element msg
+viewWebData viewFun data =
     case data of
         NotAsked ->
             Element.text "-"
@@ -252,15 +388,10 @@ viewMyData viewFun data =
             Element.text "..."
 
         Failure err ->
-            Element.text err
+            Element.text <| toString err
 
         Success thing ->
             viewFun thing
-
-
-viewGapiData : (a -> Element msg) -> GapiData a -> Element msg
-viewGapiData viewFun =
-    RemoteData.mapError toString >> viewMyData viewFun
 
 
 secondaryButton : Color.Color -> List (Element.Attribute msg) -> List (Element.Attribute msg)
@@ -311,8 +442,12 @@ viewHeaderRow model =
             { onPress = Just RefreshEvents
             , label = Element.text "Refresh Events"
             }
+        , Input.button (secondaryButton Color.green [ Element.alignRight ])
+            { onPress = Just OAuthAuthorize
+            , label = Element.text "Begin OAuth"
+            }
         , Element.el [ Element.alignRight ] <|
-            viewMyData Element.text model.calendar
+            viewWebData Element.text model.calendar
         ]
 
 
@@ -320,7 +455,7 @@ viewBody : Model -> Element Msg
 viewBody model =
     Element.column [ Element.paddingXY gutter halfGutter, spacing halfGutter ]
         [ viewInputRow model
-        , viewGapiData (viewWeekTable model.colors) model.events
+        , viewWebData (viewWeekTable model.colors) model.events
         ]
 
 
@@ -331,7 +466,7 @@ viewInputRow model =
             { onPress = Just GoBackOneWeek
             , label = Element.text "<"
             }
-        , Element.text <| "Week starting " ++ RemoteData.withDefault "?" (RemoteData.map (Date.Extra.toFormattedString "MM-dd-yyyy" << Date.Extra.floor Date.Extra.Monday << Date.Extra.add Date.Extra.Week (-1 * model.weeksBack)) model.today)
+        , Element.text <| "Week starting " ++ Maybe.withDefault "?" (Maybe.map (Date.Extra.toFormattedString "MM-dd-yyyy" << Date.Extra.floor Date.Extra.Monday << Date.Extra.add Date.Extra.Week (-1 * model.weeksBack)) model.today)
         , Input.button (secondaryButton Color.blue [ alignLeft ])
             { onPress = Just GoToCurrentWeek
             , label = Element.text "Current Week"
@@ -528,298 +663,15 @@ viewMarkIncompleteButton data =
 
 
 
----- COMMANDS ----
-
-
-type OutMsg
-    = Login
-    | LoginHint
-    | LoadApi String
-    | LoadCalendars
-    | LoadColors
-    | LoadEvents String String String
-    | CreateEvent String String String String
-    | ChangeEventColor String String ColorId
-
-
-port elmToJs : JE.Value -> Cmd msg
-
-
-sendMsg : OutMsg -> Cmd msg
-sendMsg =
-    encodeOutMsg >> elmToJs
-
-
-encodeOutMsg : OutMsg -> JE.Value
-encodeOutMsg msg =
-    case msg of
-        Login ->
-            JE.object [ ( "msg", JE.string "login" ) ]
-
-        LoginHint ->
-            JE.object [ ( "msg", JE.string "loginHint" ) ]
-
-        LoadApi email ->
-            JE.object
-                [ ( "msg", JE.string "loadapi" )
-                , ( "email", JE.string email )
-                ]
-
-        LoadCalendars ->
-            JE.object [ ( "msg", JE.string "loadCalendars" ) ]
-
-        LoadColors ->
-            JE.object [ ( "msg", JE.string "loadColors" ) ]
-
-        LoadEvents calendarId startDateString endDateString ->
-            JE.object
-                [ ( "msg", JE.string "loadEvents" )
-                , ( "calendar", JE.string calendarId )
-                , ( "timeMin", JE.string startDateString )
-                , ( "timeMax", JE.string endDateString )
-                ]
-
-        CreateEvent calendarId eventName startTimeString endTimeString ->
-            JE.object
-                [ ( "msg", JE.string "createEvent" )
-                , ( "calendar", JE.string calendarId )
-                , ( "eventName", JE.string eventName )
-                , ( "startTime", JE.string startTimeString )
-                , ( "endTime", JE.string endTimeString )
-                ]
-
-        ChangeEventColor calendarId eventId colorId ->
-            JE.object
-                [ ( "msg", JE.string "changeEventColor" )
-                , ( "calendar", JE.string calendarId )
-                , ( "event", JE.string eventId )
-                , ( "color", JE.string colorId )
-                ]
-
-
-loadEvents : Model -> Cmd msg
-loadEvents model =
-    RemoteData.map2
-        (\calendar date ->
-            LoadEvents calendar
-                (Date.Extra.toIsoString <| Date.Extra.floor Date.Extra.Saturday <| Date.Extra.add Date.Extra.Week (-1 * model.weeksBack) date)
-                (Date.Extra.toIsoString <| Date.Extra.ceiling Date.Extra.Saturday <| Date.Extra.add Date.Extra.Week (-1 * model.weeksBack) date)
-                |> sendMsg
-        )
-        model.calendar
-        model.today
-        |> RemoteData.withDefault Cmd.none
-
-
-loadEventsIfNoneUpdating : Model -> Cmd Msg
-loadEventsIfNoneUpdating model =
-    if Set.isEmpty model.updatingEvents then
-        loadEvents model
-    else
-        Cmd.none
-
-
-createEvent : String -> Model -> Cmd msg
-createEvent eventName model =
-    RemoteData.map2
-        (\calId now ->
-            CreateEvent calId
-                eventName
-                (now |> Date.Extra.floor Date.Extra.Hour |> Date.Extra.add Date.Extra.Hour -1 |> Date.Extra.toIsoString)
-                (now |> Date.Extra.floor Date.Extra.Hour |> Date.Extra.toIsoString)
-                |> sendMsg
-        )
-        model.calendar
-        model.today
-        |> RemoteData.withDefault Cmd.none
-
-
-changeEventsColor : String -> ColorId -> Model -> ( Model, Cmd msg )
-changeEventsColor eventName colorId model =
-    let
-        eventIds =
-            RemoteData.withDefault [] model.events
-                |> List.filter (.name >> (==) eventName)
-                |> List.map .id
-
-        command =
-            RemoteData.map
-                (\calId ->
-                    eventIds
-                        |> List.map (changeEventColor calId colorId)
-                        |> Cmd.batch
-                )
-                model.calendar
-                |> RemoteData.withDefault Cmd.none
-    in
-    ( { model | updatingEvents = Set.union model.updatingEvents (Set.fromList eventIds) }, command )
-
-
-changeEventColor : String -> ColorId -> String -> Cmd msg
-changeEventColor calId colorId eventId =
-    ChangeEventColor calId eventId colorId
-        |> sendMsg
-
-
-
 ---- SUBSCRIPTIONS ----
-
-
-type JsMsg
-    = GoogleYoloReady
-    | CredentialResponse (YoloData Credential)
-    | GapiReady
-    | CalendarList (MyData (List ( String, Bool )))
-    | Colors (MyData (Dict ColorId EventColor))
-    | Events (GapiData (List Event))
-    | EventCreated
-    | EventUpdated String
-
-
-port jsToElm : (JE.Value -> msg) -> Sub msg
 
 
 subscriptions : Model -> Sub Msg
 subscriptions _ =
     Sub.batch
-        [ jsToElm (JD.decodeValue jsMsgDecoder >> RxJsMsg)
-        , Time.every (5 * Time.second) (Date.fromTime >> RxDate)
+        [ Time.every (5 * Time.second) (Date.fromTime >> RxDate)
         , Time.every (60 * Time.minute) (always RefreshEvents)
         ]
-
-
-jsMsgDecoder : JD.Decoder JsMsg
-jsMsgDecoder =
-    pickDecoder "msg"
-        JD.string
-        [ ( "googleyoloready", JD.succeed GoogleYoloReady )
-        , ( "credentialsuccess", credentialSuccessDecoder )
-        , ( "credentialfail", credentialFailDecoder )
-        , ( "gapiready", JD.succeed GapiReady )
-        , ( "calendarlist", calendarListDecoder )
-        , ( "colors", colorsDecoder )
-        , ( "events", eventsDecoder )
-        , ( "eventcreated", JD.succeed EventCreated )
-        , ( "eventupdated", JD.map EventUpdated (JD.field "eventId" JD.string) )
-        ]
-
-
-credentialSuccessDecoder : JD.Decoder JsMsg
-credentialSuccessDecoder =
-    JD.map2 Credential
-        (JD.field "email" JD.string)
-        (JD.field "idToken" JD.string)
-        |> JD.map (Success >> CredentialResponse)
-
-
-credentialFailDecoder : JD.Decoder JsMsg
-credentialFailDecoder =
-    let
-        handleErrorType errorType =
-            case errorType of
-                "noCredentialsAvailable" ->
-                    JD.succeed NoCredentialsAvailable
-
-                _ ->
-                    JD.value |> JD.map UnknownYoloError
-    in
-    JDPipe.decode handleErrorType
-        |> JDPipe.requiredAt [ "error", "type" ] JD.string
-        |> JDPipe.resolve
-        |> JD.map (Failure >> CredentialResponse)
-
-
-calendarListDecoder : JD.Decoder JsMsg
-calendarListDecoder =
-    JD.oneOf
-        [ calendarListSuccessDecoder
-        , JD.succeed (Failure "Failed to get calendar list. See console.")
-        ]
-        |> JD.map CalendarList
-
-
-calendarListSuccessDecoder : JD.Decoder (RemoteData String (List ( String, Bool )))
-calendarListSuccessDecoder =
-    JD.map Success <|
-        JD.field "items" <|
-            JD.list
-                (JD.map2 (,)
-                    (JD.field "id" JD.string)
-                    (JD.map (Maybe.withDefault False) <| JD.maybe <| JD.field "primary" JD.bool)
-                )
-
-
-colorsDecoder : JD.Decoder JsMsg
-colorsDecoder =
-    JD.oneOf
-        [ JD.map (Colors << Success) <| JD.field "eventColors" <| JD.dict <| JD.map2 EventColor (JD.field "background" JD.string) (JD.field "foreground" JD.string)
-        , JD.map (Colors << Failure) <| JD.map toString <| JD.field "error" JD.value
-        ]
-
-
-eventsDecoder : JD.Decoder JsMsg
-eventsDecoder =
-    JD.oneOf
-        [ JD.map (Events << Success) <| JD.field "events" (JD.map (List.filterMap identity) <| JD.list eventDecoder)
-        , JD.map (Events << Failure) <| gapiErrorDecoder
-        ]
-
-
-eventDecoder : JD.Decoder (Maybe Event)
-eventDecoder =
-    JD.maybe <|
-        JD.map5 makeEvent
-            (JD.field "summary" JD.string)
-            (JD.at [ "start", "dateTime" ] dateDecoder)
-            (JD.at [ "end", "dateTime" ] dateDecoder)
-            (JD.field "id" JD.string)
-            (JD.field "colorId" JD.string)
-
-
-makeEvent : String -> Date -> Date -> String -> String -> Event
-makeEvent name start end id color =
-    Event name start end id color (Date.Extra.diff Date.Extra.Minute start end)
-
-
-dateDecoder : JD.Decoder Date
-dateDecoder =
-    let
-        toDateDecoder string =
-            case Date.Extra.fromIsoString string of
-                Ok date ->
-                    JD.succeed date
-
-                Err err ->
-                    JD.fail err
-    in
-    JD.string |> JD.andThen toDateDecoder
-
-
-gapiErrorDecoder : JD.Decoder GapiError
-gapiErrorDecoder =
-    let
-        statusToDecoder status =
-            case status of
-                401 ->
-                    JD.succeed GapiAuthError
-
-                _ ->
-                    JD.value |> JD.map (toString >> GapiUnknownError)
-    in
-    JD.at [ "error", "result", "error", "code" ] JD.int |> JD.andThen statusToDecoder
-
-
-pickDecoder : String -> JD.Decoder comparable -> List ( comparable, JD.Decoder b ) -> JD.Decoder b
-pickDecoder fieldName fieldDecoder decoders =
-    JD.field fieldName fieldDecoder
-        |> JD.andThen
-            (\fieldValue ->
-                decoders
-                    |> List.filter (Tuple.first >> (==) fieldValue)
-                    |> List.head
-                    |> Maybe.map Tuple.second
-                    |> Maybe.withDefault (JD.fail <| "Could not find decoder for field " ++ fieldName ++ " value of " ++ toString fieldValue)
-            )
 
 
 
@@ -828,7 +680,7 @@ pickDecoder fieldName fieldDecoder decoders =
 
 main : Program Never Model Msg
 main =
-    Html.program
+    Navigation.program (always NavigationNoOp)
         { view = view
         , init = init
         , update = update
