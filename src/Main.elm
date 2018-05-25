@@ -69,7 +69,7 @@ init location =
         |> Return.command (Task.perform RxDate Date.now)
         |> Return.effect_ (.oauthToken >> Maybe.map getCalendarList >> Maybe.withDefault Cmd.none)
         |> Return.effect_ (.oauthToken >> Maybe.map getColors >> Maybe.withDefault Cmd.none)
-        |> Return.command (Navigation.modifyUrl location.origin)
+        |> Return.command (Navigation.modifyUrl <| location.origin ++ location.pathname)
 
 
 
