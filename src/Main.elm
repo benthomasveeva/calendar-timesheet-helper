@@ -109,16 +109,20 @@ update msg model =
         RxPrimaryCalendarId data ->
             Return.singleton { model | calendar = data }
                 |> Return.effect_ loadEvents
+                |> Return.effect_ (.location >> handle401 data)
 
         RxColors data ->
             Return.singleton { model | colors = RemoteData.withDefault model.colors data }
+                |> Return.effect_ (.location >> handle401 data)
 
         RxEvents data ->
             Return.singleton { model | events = data }
+                |> Return.effect_ (.location >> handle401 data)
 
-        RxEventAck _ ->
+        RxEventAck data ->
             Return.singleton model
                 |> Return.effect_ loadEvents
+                |> Return.effect_ (.location >> handle401 data)
 
         RxDate today ->
             ( { model | today = Just today }, Cmd.none )
@@ -173,6 +177,19 @@ login location =
         , state = Nothing
         , url = "https://accounts.google.com/o/oauth2/v2/auth"
         }
+
+
+handle401 : WebData a -> Navigation.Location -> Cmd Msg
+handle401 data =
+    case data of
+        Failure (Http.BadStatus response) ->
+            if response.status.code == 401 then
+                login
+            else
+                always Cmd.none
+
+        _ ->
+            always Cmd.none
 
 
 getCalendarList : OAuth.ResponseToken -> Cmd Msg
