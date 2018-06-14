@@ -100,7 +100,7 @@ type Msg
     | GoForwardOneWeek
     | GoToCurrentWeek
     | OAuthAuthorize
-    | NavigationNoOp
+    | NavigationHappened Navigation.Location
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -155,8 +155,8 @@ update msg model =
             Return.singleton model
                 |> Return.effect_ (.location >> login)
 
-        NavigationNoOp ->
-            Return.singleton model
+        NavigationHappened location ->
+            Return.singleton { model | location = location }
 
 
 
@@ -680,7 +680,7 @@ subscriptions _ =
 
 main : Program Never Model Msg
 main =
-    Navigation.program (always NavigationNoOp)
+    Navigation.program NavigationHappened
         { view = view
         , init = init
         , update = update
