@@ -80,7 +80,7 @@ init _ url key =
         |> Return.command (Task.perform RxTimeZone Time.here)
         |> Return.effect_ (.auth >> Maybe.map getCalendarList >> Maybe.withDefault Cmd.none)
         |> Return.effect_ (.auth >> Maybe.map getColors >> Maybe.withDefault Cmd.none)
-        |> Return.command (Browser.Navigation.replaceUrl key <| "/")
+        |> Return.command (Browser.Navigation.replaceUrl key <| url.path)
 
 
 authResultToMaybe : OAuth.Implicit.AuthorizationResult -> Maybe OAuth.Implicit.AuthorizationSuccess
