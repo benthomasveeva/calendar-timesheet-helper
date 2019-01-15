@@ -212,7 +212,7 @@ login : Url.Url -> Cmd Msg
 login url =
     OAuth.Implicit.makeAuthUrl
         { clientId = "159193416244-l4tsfgdhbn402qq57ajahsf3cu41vno0.apps.googleusercontent.com"
-        , redirectUri = { url | query = Nothing, fragment = Nothing, path = "" }
+        , redirectUri = { url | query = Nothing, fragment = Nothing }
         , scope = [ "email", "profile", "https://www.googleapis.com/auth/calendar" ]
         , state = Nothing
         , url =
